@@ -1,0 +1,82 @@
+{
+  "id": "phone-vapi-webhook-poc",
+  "name": "Phone – Vapi Webhook",
+  "active": false,
+  "settings": {},
+  "nodes": [
+    {
+      "id": "c9335f5e-e07d-4b6c-87b6-bd7159eefc57",
+      "name": "Vapi Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "e3def1cd-477b-4fb7-b0db-6be4239e3da0",
+      "name": "Route & Guardrail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const body = $input.first().json.body || {};\nconst message = body.message || {};\nconst type = message.type;\n\nconst ALLOWED_FUNCTIONS = ['check_order_status', 'escalate_to_human'];\n\nlet responseBody;\nlet audit;\n\nif (type === 'tool-calls') {\n  const toolCalls = message.toolCallList || [];\n  const results = [];\n  const statuses = [];\n  const reasons = [];\n\n  for (const call of toolCalls) {\n    const name = (call.function && call.function.name) || call.name;\n    const params = (call.function && call.function.arguments) || call.parameters;\n    const allowed = ALLOWED_FUNCTIONS.includes(name);\n    let resultText;\n    let status;\n    let reason = null;\n\n    if (!allowed) {\n      status = 'blocked';\n      reason = `Function \"${name}\" is not in the allow-list`;\n      resultText = \"I'm not able to do that directly — let me get a person to help with that.\";\n    } else if (name === 'escalate_to_human') {\n      status = 'escalated';\n      resultText = \"I've flagged this for a team member to follow up on.\";\n    } else {\n      status = 'success';\n      resultText = `Placeholder lookup result for ${name} with params ${JSON.stringify(params)}. Wire this up to a real data source next.`;\n    }\n\n    results.push({ toolCallId: call.id, name, result: resultText });\n    statuses.push(status);\n    if (reason) reasons.push(reason);\n  }\n\n  responseBody = { results };\n  audit = {\n    source: 'phone',\n    actor: (message.call && message.call.customer && message.call.customer.number) || (message.call && message.call.id) || 'unknown',\n    action: 'tool_calls',\n    details: { toolCallList: toolCalls, results },\n    status: statuses.includes('blocked') ? 'blocked' : (statuses.includes('escalated') ? 'escalated' : 'success'),\n    reason: reasons.join('; ') || null,\n  };\n} else if (type === 'end-of-call-report') {\n  responseBody = {};\n  audit = {\n    source: 'phone',\n    actor: (message.call && message.call.customer && message.call.customer.number) || (message.call && message.call.id) || 'unknown',\n    action: 'call_completed',\n    details: {\n      endedReason: message.endedReason,\n      transcript: message.artifact ? message.artifact.transcript : undefined,\n    },\n    status: 'success',\n    reason: null,\n  };\n} else {\n  responseBody = {};\n  audit = {\n    source: 'phone',\n    actor: (message.call && message.call.id) || 'unknown',\n    action: type || 'unknown_event',\n    details: message,\n    status: 'success',\n    reason: null,\n  };\n}\n\nreturn [{ json: { responseBody, audit } }];"
+      }
+    },
+    {
+      "id": "2e9130ac-17f5-4d0a-8008-1ec4ab246432",
+      "name": "Log Audit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [680, 200],
+      "parameters": {
+        "resource": "database",
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (source, actor, action, details, status, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+        "options": {
+          "queryReplacement": "={{ [$json.audit.source, $json.audit.actor, $json.audit.action, $json.audit.details ? JSON.stringify($json.audit.details) : null, $json.audit.status, $json.audit.reason] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "id": "d6e9140b-76ec-4eb1-bd3f-10649cd960f1",
+      "name": "Respond to Vapi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [680, 400],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.responseBody }}"
+      }
+    }
+  ],
+  "connections": {
+    "Vapi Webhook": {
+      "main": [
+        [
+          { "node": "Route & Guardrail", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Route & Guardrail": {
+      "main": [
+        [
+          { "node": "Log Audit", "type": "main", "index": 0 },
+          { "node": "Respond to Vapi", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  }
+}
