@@ -1,0 +1,277 @@
+{
+  "id": "documents-poc",
+  "name": "Documents - Extraction Assistant",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment",
+          "readStatus": "unread"
+        },
+        "options": {
+          "dataPropertyAttachmentsPrefixName": "attachment_",
+          "downloadAttachments": true
+        }
+      },
+      "id": "10bcbee4-94f3-4485-8bf0-4419e921b6e6",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        240,
+        304
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "<your-n8n-gmail-credential-id>",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "binaryToPropery",
+        "binaryPropertyName": "attachment_0",
+        "destinationKey": "fileBase64",
+        "options": {}
+      },
+      "id": "511dcca8-19eb-4fbd-8cde-6975e658dc82",
+      "name": "Extract Attachment",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        464,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const base64Data = $json.fileBase64;\nconst triggerItem = $('Gmail Trigger').item;\nconst binaryMeta = triggerItem.binary && triggerItem.binary['attachment_0'];\nconst mimeType = (binaryMeta && binaryMeta.mimeType) || 'application/pdf';\nconst fileName = (binaryMeta && binaryMeta.fileName) || 'attachment';\nconst email = triggerItem.json;\n\nconst isPdf = mimeType.includes('pdf');\nconst contentBlock = isPdf\n  ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } }\n  : { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } };\n\nconst systemPrompt = `You extract structured data from business documents (invoices, receipts, forms).\n\nLook at the attached document and return ONLY a JSON object, no markdown, no code fences, in exactly this shape:\n{\n  \"document_type\": \"invoice\" | \"receipt\" | \"form\" | \"unknown\",\n  \"vendor\": \"<string or null>\",\n  \"total_amount\": <number or null>,\n  \"document_date\": \"<YYYY-MM-DD or null>\",\n  \"fields\": [ { \"name\": \"<field name>\", \"value\": \"<extracted value>\", \"page\": <page number the value was found on, integer, 1-indexed> } ],\n  \"confident\": true or false,\n  \"reason\": \"<one short sentence, for internal use only>\"\n}\n\nOnly set confident to true if the document is clearly legible and the key fields (vendor, total, date) were actually found. If the document is blank, unreadable, or not actually a business document, set confident to false and explain why in reason.`;\n\nconst requestBody = {\n  model: 'claude-sonnet-5',\n  max_tokens: 1536,\n  system: systemPrompt,\n  messages: [\n    { role: 'user', content: [ contentBlock, { type: 'text', text: 'Extract the structured data from this document.' } ] }\n  ],\n};\n\nlet fromAddress = '';\nif (email.from) {\n  if (typeof email.from === 'string') {\n    const m = email.from.match(/<([^>]+)>/);\n    fromAddress = m ? m[1] : email.from;\n  } else if (typeof email.from === 'object') {\n    fromAddress = (email.from.value && email.from.value[0] && email.from.value[0].address) || email.from.text || '';\n  }\n}\n\nreturn [{\n  json: {\n    requestBody,\n    original: {\n      fileName,\n      mimeType,\n      base64Data,\n      emailSubject: email.subject,\n      emailFrom: fromAddress,\n      messageId: email.messageId || email.id,\n    },\n  },\n}];"
+      },
+      "id": "3439c4dd-f9ef-4745-b61a-2405de7576ef",
+      "name": "Build Extraction Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {}
+      },
+      "id": "604f1a9b-c94b-43c6-8d3a-b5d7ef54669d",
+      "name": "Call Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        304
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "<your-n8n-anthropic-credential-id>",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst original = $('Build Extraction Prompt').item.json.original;\n\nlet text = '';\nif (response.content && response.content[0] && response.content[0].text) {\n  text = response.content[0].text;\n}\ntext = text.trim();\nif (text.startsWith('```')) {\n  text = text.replace(/^```(json)?/i, '').replace(/```$/, '').trim();\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(text);\n} catch (e) {\n  parsed = { document_type: 'unknown', vendor: null, total_amount: null, document_date: null, fields: [], confident: false, reason: 'Failed to parse model response as JSON' };\n}\n\nconst confident = parsed.confident === true;\nconst status = confident ? 'success' : 'needs_review';\n\nconst documentRecord = {\n  source: 'gmail-attachment',\n  sourceRef: `${original.messageId}:${original.fileName}`,\n  fileName: original.fileName,\n  fileBase64: original.base64Data,\n  documentType: parsed.document_type || 'unknown',\n  vendor: parsed.vendor || null,\n  totalAmount: parsed.total_amount || null,\n  documentDate: parsed.document_date || null,\n  extracted: { fields: parsed.fields || [], emailSubject: original.emailSubject, emailFrom: original.emailFrom },\n  status,\n  reason: parsed.reason || null,\n};\n\nconst audit = {\n  source: 'documents',\n  actor: original.emailFrom || 'unknown',\n  action: 'extract_document',\n  details: { fileName: original.fileName, documentType: documentRecord.documentType, status },\n  status,\n  reason: parsed.reason || null,\n};\n\nreturn [{ json: { documentRecord, audit } }];"
+      },
+      "id": "62c44cfa-daaf-4a8a-807b-dae7627a6d74",
+      "name": "Parse Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json.audit }];"
+      },
+      "id": "5ea54a94-d8b5-49c3-b2f9-25e066d99e82",
+      "name": "Build Audit Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (source, actor, action, details, status, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+        "options": {
+          "queryReplacement": "={{ [$json.source, $json.actor, $json.action, $json.details ? JSON.stringify($json.details) : null, $json.status, $json.reason] }}"
+        }
+      },
+      "id": "a4ba1d86-2660-4723-a068-24e7dc89facf",
+      "name": "Log Audit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        208
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json.documentRecord }];"
+      },
+      "id": "8a813375-0f3c-4440-ac82-829db5202252",
+      "name": "Build Document Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO documents (source, source_ref, file_name, file_bytes, document_type, vendor, total_amount, document_date, extracted, status, reason) VALUES ($1, $2, $3, decode($4, 'base64'), $5, $6, $7, $8, $9, $10, $11)",
+        "options": {
+          "queryReplacement": "={{ [$json.source, $json.sourceRef, $json.fileName, $json.fileBase64, $json.documentType, $json.vendor, $json.totalAmount, $json.documentDate, JSON.stringify($json.extracted), $json.status, $json.reason] }}"
+        }
+      },
+      "id": "d8d5312c-964f-46c4-82e6-fe1222da7610",
+      "name": "Insert Document",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract Attachment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Attachment": {
+      "main": [
+        [
+          {
+            "node": "Build Extraction Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Extraction Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude": {
+      "main": [
+        [
+          {
+            "node": "Parse Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Extraction": {
+      "main": [
+        [
+          {
+            "node": "Build Audit Record",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Document Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Audit Record": {
+      "main": [
+        [
+          {
+            "node": "Log Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Document Record": {
+      "main": [
+        [
+          {
+            "node": "Insert Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

@@ -1,0 +1,171 @@
+{
+  "id": "crm-poc",
+  "name": "CRM - Escalation Sync",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "508ab3df-9dbf-4415-be88-7eef26926b22",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, actor, action, reason, created_at FROM audit_log WHERE source='inbox' AND status='escalated' AND synced_to_crm = false ORDER BY created_at ASC LIMIT 20",
+        "options": {}
+      },
+      "id": "1a305b25-d36c-455a-a8a4-8d2a0b79c354",
+      "name": "Find New Escalations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        464,
+        304
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "email": "={{ $json.actor }}",
+        "additionalFields": {
+          "firstName": "={{ $json.actor.split('@')[0] }}"
+        },
+        "options": {}
+      },
+      "id": "de3ec11f-3b66-4ab0-a9bb-f89fcbca06f4",
+      "name": "Upsert Contact",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.2,
+      "position": [
+        688,
+        304
+      ],
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "<your-n8n-hubspot-credential-id>",
+          "name": "HubSpot Service Key account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "deal",
+        "stage": "4052870883",
+        "additionalFields": {
+          "associatedVids": "={{ [$json.vid] }}",
+          "closeDate": "={{ $now.plus({ hours: 24 }).toISO() }}",
+          "dealName": "={{ 'Follow up: ' + $('Find New Escalations').item.json.action }}",
+          "pipeline": "default"
+        }
+      },
+      "id": "b9d082cf-ae2f-4553-aac5-9777b9a6d037",
+      "name": "Create Deal",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.2,
+      "position": [
+        912,
+        304
+      ],
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "<your-n8n-hubspot-credential-id>",
+          "name": "HubSpot Service Key account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE audit_log SET synced_to_crm = true, crm_contact_id = $1, crm_task_id = $2 WHERE id = $3",
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Contact').item.json.vid, $json.dealId, $('Find New Escalations').item.json.id] }}"
+        }
+      },
+      "id": "8a01f3bd-3b82-4ce5-938e-ab51272dd513",
+      "name": "Mark Synced",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1120,
+        304
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Find New Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find New Escalations": {
+      "main": [
+        [
+          {
+            "node": "Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Deal": {
+      "main": [
+        [
+          {
+            "node": "Mark Synced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

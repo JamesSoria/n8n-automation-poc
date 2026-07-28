@@ -1,0 +1,248 @@
+{
+  "id": "inbox-poc",
+  "name": "Inbox - Gmail Draft Assistant",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "readStatus": "unread"
+        },
+        "options": {}
+      },
+      "id": "8d05cff6-776b-461c-a439-c1dce727a35b",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        240,
+        304
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "<your-n8n-gmail-credential-id>",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const email = $input.first().json;\n\nconst KNOWLEDGE_BASE = [\n  { question: \"What are your hours?\", answer: \"We're open Monday through Friday, 9am to 5pm.\" },\n  { question: \"What is your return policy?\", answer: \"Items can be returned within 30 days with a receipt for a full refund.\" },\n  { question: \"How do I book a consultation?\", answer: \"Reply with a few times that work for you and we'll confirm a slot, or book directly at our scheduling link.\" },\n  { question: \"Do you offer refunds for cancellations?\", answer: \"Cancellations made more than 24 hours in advance receive a full refund.\" },\n];\n\nconst knowledgeText = KNOWLEDGE_BASE.map(kb => `Q: ${kb.question}\\nA: ${kb.answer}`).join('\\n\\n');\n\nconst systemPrompt = `You are drafting email replies on behalf of a small business, in a warm and professional voice.\n\nYou have the following documented answers to draw from:\n\n${knowledgeText}\n\nRead the customer's email below. If their question is clearly answered by the documented answers above, draft a short, natural reply grounded in that information. If it is not covered, or the request is ambiguous, unusual, or sensitive, do not guess \u2014 mark it as not confident instead.\n\nRespond with ONLY a JSON object, no markdown formatting, no code fences, in exactly this shape:\n{\"draft\": \"<the reply text, or null if not confident>\", \"confident\": true or false, \"reason\": \"<one short sentence, for internal use only, explaining your decision>\"}`;\n\nconst requestBody = {\n  model: 'claude-sonnet-5',\n  max_tokens: 1024,\n  system: systemPrompt,\n  messages: [\n    { role: 'user', content: `Subject: ${email.subject || ''}\\n\\n${email.text || email.snippet || ''}` }\n  ],\n};\n\nlet fromAddress = '';\nif (email.from) {\n  if (typeof email.from === 'string') {\n    const m = email.from.match(/<([^>]+)>/);\n    fromAddress = m ? m[1] : email.from;\n  } else if (typeof email.from === 'object') {\n    fromAddress = (email.from.value && email.from.value[0] && email.from.value[0].address) || email.from.text || '';\n  }\n}\n\nreturn [{\n  json: {\n    requestBody,\n    original: {\n      from: fromAddress,\n      fromAddress,\n      subject: email.subject,\n      threadId: email.threadId,\n      messageId: email.messageId || email.id,\n    },\n  },\n}];"
+      },
+      "id": "75db0524-ce61-490e-9629-1f5462f17748",
+      "name": "Build Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {}
+      },
+      "id": "f602e6fe-f2f7-4564-8bcb-10f05388431d",
+      "name": "Call Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        688,
+        304
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "<your-n8n-anthropic-credential-id>",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst original = $('Build Prompt').item.json.original;\n\nlet text = '';\nif (response.content && response.content[0] && response.content[0].text) {\n  text = response.content[0].text;\n}\n\ntext = text.trim();\nif (text.startsWith('```')) {\n  text = text.replace(/^```(json)?/i, '').replace(/```$/, '').trim();\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(text);\n} catch (e) {\n  parsed = { draft: null, confident: false, reason: 'Failed to parse model response as JSON' };\n}\n\nconst confident = parsed.confident === true && !!parsed.draft;\n\nconst audit = {\n  source: 'inbox',\n  actor: original.fromAddress || original.from || 'unknown',\n  action: 'draft_reply',\n  details: { subject: original.subject, modelReason: parsed.reason, draftCreated: confident },\n  status: confident ? 'success' : 'escalated',\n  reason: confident ? null : (parsed.reason || 'Low confidence, routed to a person'),\n};\n\nconst draft = confident ? {\n  subject: `Re: ${original.subject || ''}`,\n  message: parsed.draft,\n  sendTo: original.fromAddress || '',\n  threadId: original.threadId || '',\n} : null;\n\nreturn [{ json: { audit, draft, confident } }];"
+      },
+      "id": "ec785979-088a-4a71-a60f-3618b16f991d",
+      "name": "Parse Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json.audit }];"
+      },
+      "id": "a5b30f97-24d1-48fe-a646-7d027b0c2391",
+      "name": "Build Audit Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (source, actor, action, details, status, reason) VALUES ($1, $2, $3, $4, $5, $6)",
+        "options": {
+          "queryReplacement": "={{ [$json.source, $json.actor, $json.action, $json.details ? JSON.stringify($json.details) : null, $json.status, $json.reason] }}"
+        }
+      },
+      "id": "dff0f0ce-f0fd-4abf-bc1a-050cc375751d",
+      "name": "Log Audit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1344,
+        208
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "<your-n8n-postgres-credential-id>",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nif (!item.confident || !item.draft) {\n  return [];\n}\nreturn [{ json: item.draft }];"
+      },
+      "id": "e27d57eb-28a9-404a-a365-57aed60dbb24",
+      "name": "Build Draft If Confident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.message }}",
+        "options": {
+          "threadId": "={{ $json.threadId }}",
+          "sendTo": "={{ $json.sendTo }}"
+        }
+      },
+      "id": "b1c2d3e4-f5a6-4789-9abc-def012345678",
+      "name": "Create Draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1344,
+        400
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "<your-n8n-gmail-credential-id>",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude": {
+      "main": [
+        [
+          {
+            "node": "Parse Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Response": {
+      "main": [
+        [
+          {
+            "node": "Build Audit Record",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Draft If Confident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Audit Record": {
+      "main": [
+        [
+          {
+            "node": "Log Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Draft If Confident": {
+      "main": [
+        [
+          {
+            "node": "Create Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
